@@ -176,49 +176,11 @@ return connCtx.kernalContext().query().querySqlFields(null, qry,
 ```
 即 `GridQueryProcessor.querySqlFields` 的 6 参重载 `:3000`(cctx=`null`,无缓存对象参与)。详见 §5.3。
 
-### 1.3 深入:从 `querySqlFields:922` 到网络层的核心流程
-
-两条入口路径最终都汇到 `IgniteH2Indexing.querySqlFields:922`(运行在**接收并执行该 SQL 的节点**)。本小节给出从该点直到"经 discovery 把请求发到各服务端节点"的**核心路径聚焦视图**;逐字代码与各层细节见 §2(DDL 处理)、§3(分布式机制)、§6(返回路径)。
-
-**入口 → 网络层 核心路径(聚焦视图):**
-
-```mermaid
-flowchart TD
-    A["IgniteH2Indexing.querySqlFields :922<br/>parser.parse :940 (H2 → GridSql AST)"]:::entry
-    A --> B{"parseRes.isCommand()?<br/>:964"}:::dec
-    B -->|"是 (CREATE TABLE)"| C["executeCommand :863<br/>local 守卫 :875-878 · registerRunningQuery :880"]
-    C --> D["CommandProcessor.runCommand :887/132<br/>convertH2Command :204 返回 null → runCommandH2 :162"]
-    D --> E["runCommandH2 :239 · GridSqlCreateTable 分支<br/>权限 :246 · 存在性 :250 · toQueryEntity :258<br/>CACHE_NAME 分叉 :271"]
-    E --> F["dynamicTableCreate :2215<br/>构建 CacheConfiguration (schema/参数)<br/>交棒 getOrCreateCache0 :2293"]:::core
-    F --> G["IgniteKernal.getOrCreateCache0 :2306<br/>sql → dynamicStartSqlCache :3476"]
-    G --> H["dynamicStartCache :3504 闭包<br/>prepareCacheChangeRequest :5085<br/>★ schema 打包 :5176"]:::core
-    H --> I["initiateCacheChanges :4080<br/>pendingFuts :4115 · sendCustomEvent :4137"]:::net
-    I --> J[("GridDiscoveryManager.sendCustomEvent :2301<br/>→ TcpDiscoverySpi :537 → discovery 环<br/>广播 DynamicCacheChangeBatch 给所有 server 节点")]:::net
-
-    classDef entry fill:#fff3cd,stroke:#b8860b;
-    classDef dec fill:#ffe6cc,stroke:#d79b00;
-    classDef core fill:#dae8fc,stroke:#6c8ebf;
-    classDef net fill:#d4edda,stroke:#28a745,stroke-width:2px;
-```
-
-**8 个核心步骤(精炼,file:line):**
-
-1. **解析 + 命令识别** — `querySqlFields:922` 循环支持多语句;`parser.parse:940` 把 SQL 经 H2 转成 `GridSql` AST;`checkClusterState:961`;`isCommand():964` 判出 DDL → `executeCommand:863`。
-2. **守卫 + 注册** — local 守卫 `:875-878`(CREATE TABLE 不允许 `setLocal(true)`,否则抛 `UNSUPPORTED_OPERATION`);`registerRunningQuery:880`;`cmdProc.runCommand:887`。
-3. **命令分派** — `runCommand:132` 先 `convertH2Command:204`,但该方法**只**转 INDEX(`:205/220`),CREATE TABLE 返回 `null` → 落入 `runCommandH2:162`(H2 直连分支)。
-4. **建表执行(最核心)** — `runCommandH2:239` 的 `GridSqlCreateTable` 分支:权限 `CACHE_CREATE:246` → 本地 catalog 存在性 `schemaMgr.dataTable:250` → `toQueryEntity:258`(AST→`QueryEntity`)→ **`CACHE_NAME` 分叉 `:271`**:指向已有缓存则 `dynamicAddQueryEntity:272`,否则 `dynamicTableCreate:281`(新建主路径)。
-5. **构建 `CacheConfiguration`** — `dynamicTableCreate:2215`:据模板 `:2234`(PARTITIONED/REPLICATED)装所有 `WITH` 字段 `:2257-2288`;交棒 `ctx.grid().getOrCreateCache0(ccfg, true):2293`(★ 离开查询处理器进入缓存层)。
-6. **交棒缓存层** — `IgniteKernal.getOrCreateCache0:2306` 因 `sql=true` 走 `dynamicStartSqlCache:3476` → `dynamicStartCache:3504`。
-7. **构造分布式请求** — 闭包 `:3525` → `prepareCacheChangeRequest:5085`:新建 `DynamicCacheChangeRequest:5102`,新缓存分支 `:5156` 把 **`CacheConfiguration`(`:5168`)+ `QuerySchema`(`:5176`)** 打包进请求。
-8. **出网★** — `initiateCacheChanges:4080`:建 `DynamicCacheStartFuture` 入 `pendingFuts:4115`,`ctx.discovery().sendCustomEvent(new DynamicCacheChangeBatch(sndReqs)):4137` → `GridDiscoveryManager:2301` → `TcpDiscoverySpi:537` 投入 discovery 环,广播给**集群所有 server 节点**。
-
-> 关键时序:发起方在 `:2293` 的 `.get2()` **阻塞**,直到该请求对应的 `DynamicCacheStartFuture` 在 PME(分区交换)完成后被 `completeCacheStartFuture:2999` 唤醒(§6)。即 CREATE TABLE 是一次集群级操作——网络广播出去后,发起方一直等到全集群交换结束才"收回"控制权。
-
-**一句话串讲:** `querySqlFields:922` 解析 → `executeCommand:863` 守卫+注册 → `runCommandH2:162` 建表分支(权限/存在性/`toQueryEntity`/`CACHE_NAME` 分叉)→ `dynamicTableCreate:2215` 装配 `CacheConfiguration` → `getOrCreateCache0:2293` 交棒 → `prepareCacheChangeRequest:5085` 把 `CacheConfiguration`+`QuerySchema` 打进 `DynamicCacheChangeRequest` → `initiateCacheChanges:4137` 经 `sendCustomEvent(DynamicCacheChangeBatch)` **出 discovery 环发到所有服务端节点**。
-
 ---
 
 ## 2. DDL 处理层(发起节点:解析 + 构建 CacheConfiguration)
+
+本层在**发起节点**上完成(从 §1 末尾的 `querySqlFields:922` 起):解析 SQL → `QueryEntity` → `CacheConfiguration`,到 `getOrCreateCache0:2293` 交棒给缓存/分布式层为止。发起节点可能是 client(嵌入式厚 client)或 server(JDBC thin);**发起节点 → 集群各节点**的真正边界在 §3.1 末尾的 `sendCustomEvent:4137`。
 
 ### 图 3 — DDL 处理流水线(解析 → AST → QueryEntity → CacheConfiguration → 交棒)
 
