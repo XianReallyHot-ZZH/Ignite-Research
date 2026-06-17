@@ -1,0 +1,3 @@
+[submodule "vendors/ignite"]
+	path = vendors/ignite
+	url = https://github.com/apache/ignite
