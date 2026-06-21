@@ -120,6 +120,50 @@ flowchart TD
 
 ---
 
+## 台阶五:行放不下一页怎么办——分片(fragment)
+
+> 前面四个台阶都默认"一条行能塞进一页"。但如果 value 很大——比如一个 100KB 的 blob——**一条行的字节超过一页(4KB)能装下的量**,怎么办?Ignite 不会报错,而是把它**切成多片、跨页存放**,用链表串起来。
+
+**痛点** — 页是定长 4KB 的管理单位,没法为一行临时撑大;而 value 可以任意大。一行放不下整页时,只能跨页拆。
+
+**原理(分片 + 链表)** — 把这条大行切成多个**分片(fragment)**,每片存进一个数据页,分片之间用 **nextLink** 串成链表:
+
+```mermaid
+flowchart LR
+    L["行 link"] --> A["页A · 链头分片<br/>size, nextLink, key+值前段"]
+    A -->|"nextLink"| B["页B · 中间分片<br/>size, nextLink, 值中段"]
+    B -->|"nextLink"| C["页C · 链尾分片<br/>size, nextLink=0, 值尾+version"]
+```
+
+每个分片在一页里的字节布局:
+
+```
+┌──────────────┬───────────┬─────────────────────────┐
+│ payloadSize  │ nextLink  │ 这一段行字节             │
+│ short(2B),   │ long(8B): │ (key/value/version 的   │
+│ 最高位是     │ 下一分片  │  某连续段)              │
+│ FRAGMENTED旗 │ 的 link   │                         │
+└──────────────┴───────────┴─────────────────────────┘
+```
+
+要点:
+
+- **行的 link 指向"含 key 的链头分片"**(写入时含 key 的那段最后写,落成链头)。
+- 每个分片存一个 **nextLink** 指向下一个分片(朝尾部);链尾分片的 `nextLink=0`。
+- 槽位(item)照常记链头分片的 dataOff,只是它的 payloadSize 带着 **FRAGMENTED_FLAG**(short 最高位=1),表示"我是分片,后面还有 nextLink 要跟"。
+
+**插入** — `insertDataRow` 循环调 `writeSinglePage` → `addRowFragment`:**每页写"当前能放下的最大一段"**,用 nextLink 串起来,直到整行写完(`written == COMPLETE`)。每个分片单独经 FreeList 取一个数据页落地;行 link 最终落在含 key 的链头分片。
+
+**查询/读** — `readPayload` 先读出本段;若 `FRAGMENTED_FLAG=1`,就取 nextLink,**跳到下一个数据页**继续读、拼接,直到 `nextLink=0`。因为 **key 在链头分片**,只按 key 比对的查找(如 B+树 `findOne`)读第一个分片就够;要完整 value 才走完整条链。
+
+**删除** — `removeDataRowByLink(link)` 先 `removeRow` 删掉链头分片(`removeRow` 会返回该分片的 nextLink),然后**沿 nextLink 链逐个删除**后续分片,直到 `nextLink=0`;腾出的页进 reuseList 回收。
+
+**为什么这么设计 / 代价** — 页定长、放不下只能跨页拆;分片数不固定、每片要独立落到"当时有空闲"的页,所以用**链表**(而非固定数组)串联。代价:每个分片约 `2(payloadSize)+8(nextLink)+2(item)=12` 字节额外开销,超大 value 会散在多页,读写都要跨页跳。
+
+📍 **代码锚点**:分片写入循环 `AbstractFreeList.insertDataRow:584` → `writeSinglePage` → `AbstractDataPageIO.addRowFragment:1126`;分片字节布局 `DataPageIO.writeFragmentData:83`;读 `AbstractDataPageIO.readPayload:637` + `getNextFragmentLink:614`;删除 `AbstractFreeList.removeDataRowByLink:806`(沿链逐个删)。对应 03 §5.3、§8.3。
+
+---
+
 ## 深入(选读):数据页 item 机制
 
 > 前面台阶一为了入门,把 item 机制简化了。这一节把它**到底怎么动**讲透——删一条、插一条时槽位怎么变、itemId 怎么复用、为什么这么设计。**初读可跳过**,等你想搞懂"删除/更新后页内到底发生了什么"再回来。
