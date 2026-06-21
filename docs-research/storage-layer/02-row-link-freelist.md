@@ -120,6 +120,224 @@ flowchart TD
 
 ---
 
+## 深入(选读):数据页 item 机制
+
+> 前面台阶一为了入门,把 item 机制简化了。这一节把它**到底怎么动**讲透——删一条、插一条时槽位怎么变、itemId 怎么复用、为什么这么设计。**初读可跳过**,等你想搞懂"删除/更新后页内到底发生了什么"再回来。
+
+### 1. 一个 item 长什么样?怎么区分 direct / indirect?
+
+每个 item 固定 **2 字节**,但这两字节按**位置**有两种解释。区分类型**不看内容,只看下标**——下标落在 `[0, directCnt)` 就是 direct,落在 `[directCnt, directCnt+indirectCnt)` 就是 indirect(页头存了 `directCnt`、`indirectCnt` 两个 1 字节计数):
+
+```
+items 表(每项 2 字节):
+┌──────┬──────┬────────────┬──────────────────┐
+│ idx0 │ idx1 │   ......   │ idx=directCnt... │
+│direct│direct│   direct   │    indirect      │
+└──────┴──────┴────────────┴──────────────────┘
+ ├──── direct 段 [0, directCnt) ────┤├── indirect 段 ──┤
+```
+
+两种 item 的 2 字节含义不同:
+
+```
+direct  item:  [ dataOff(2B) ]                         ← 行字节在页内的偏移;它的 itemId = 它的下标
+indirect item: [ itemId(高1B) | directIdx(低1B) ]      ← 自己对外的id | 指向"真正存 dataOff 的那个 direct item"的下标
+```
+
+> 关键:**同一片 2 字节,在 direct 位上读成"dataOff",在 indirect 位上读成"[itemId|directIdx]"——解释方式由位置决定。** 这也是为什么 direct 段必须连续(下面会用到)。
+
+### 2. 删一条"中间行":把末尾行搬进洞,再留个 indirect 指路
+
+删一条行,它的外部 link(B+树里那条)会被移除;但物理上不能留个"洞"在 direct 段中间(否则 `[0,directCnt)` 连续就破了,判型规则失效)。Ignite 的做法是(`moveLastItem`):
+
+1. 把**末尾那个 direct item**(下标 = `directCnt-1`)的 dataOff,**搬进被删的洞**;
+2. 把腾出来的**末尾槽改成 indirect**,记录"被搬的那行 itemId,现在指向新位置"。
+
+这样洞被挪到了 direct 段边界,`directCnt` 减 1 就收掉了,direct 段重新连续。代价:只动 1 个 item + 写 1 个 indirect。
+
+### 3. 完整 trace:删一条,再插一条
+
+设一页有 a,b,c,d,e(directCnt=5),B+树里每行的 link 就是它的 itemId:
+
+```
+下标:    0     1     2     3     4
+item:  [ a |   b |   c |   d |   e ]              directCnt=5  indirectCnt=0
+link:   a→0   b→1   c→2   d→3   e→4
+```
+
+**删 b(itemId=1)**:b 的 link 移除;末尾的 e 搬进洞1,槽4 变 indirect(4→1)。
+
+```
+下标:    0     1     2     3     4
+item:  [ a |   e |   c |   d |  (4→1) ]           directCnt=4  indirectCnt=1
+                                  ▲ indirect
+读法:
+  itemId=4 → (4→1) → 槽1 → e      ✅ e 的 link 完好(只是从槽4搬到了槽1)
+  itemId=1 → 槽1 → e              ⚠️ 但 itemId=1 是"死的"(b 已删,B+树里没有 1 了)
+活 link: a→0  c→2  d→3  e→4        死号:itemId=1
+```
+
+**插 f**:新行候选 itemId = `directCnt` = 4;正好有个 indirect 的 itemId=4,触发**转换**。注意——**转换不是把 4 给 f**,而是:
+
+```
+① e 从借住的槽1,搬回它的本命槽4 → itemId=4 仍指向 e ✅(活 link 没破)
+② f 接管被释放的死槽1(itemId=1)→ f 拿到全新 link itemId=1 ✅(复用的是死号)
+
+下标:    0     1     2     3     4
+item:  [ a |   f |   c |   d |   e ]              directCnt=5  indirectCnt=0
+活 link: a→0  f→1  c→2  d→3  e→4                  全部正确!
+```
+
+> **铁律:被复用的 itemId,必定是"原主已删、B+树 link 已移除"的死号。** 活的 itemId 永远不被新行抢占——所以你担心的"指错"不会发生。indirect item 的角色是"一个活行暂借了死槽,留张条子说明真身";转换就是"归还借用 + 死槽再利用"。
+
+### 4. 为什么非这么设计不可?(四换一)
+
+这一套用一个 indirect item(2 字节)的代价,同时换来四件事:
+
+| 想要的 | 这套设计怎么给 |
+|---|---|
+| 行能在页内搬、但**外部 link 不变**(不用动 B+树) | indirect item 当间接层 |
+| **O(1)** 判 direct / indirect | direct 段连续前缀,看下标 vs `directCnt` |
+| 删除 **O(1)**、只动一个 item | 搬末尾行填洞 |
+| **itemId 可回收**(扛得住无限增删) | 插入时转换,死号复用 |
+
+两个推论:
+
+- **`indirectCnt ≤ directCnt` 恒成立**:每条活行恰好占一个 direct 槽(它的 dataOff 在那);indirect item 对应的是"被搬过的活行",是活行的子集,所以不会比 direct 槽多。
+- **"死槽死在那"为什么不行**:① itemId 每页上限 `0xFE=254`,不回收的话一页**最多接受 254 次 insert** 就废了(哪怕字节还空着);② 留洞会破坏 direct 段连续性,第 1 条的 O(1) 判型规则就失效,得额外加位图/自由链表。所以这套机制不是"可以偷懒的地方",而是它存在的核心理由。
+
+📍 **代码锚点**:item 编解码 `AbstractDataPageIO.indirectItem / directItemIndex / itemId`(`:691-723`);判型靠页头 `directCnt`/`indirectCnt`;删除搬运 `moveLastItem`(`:734`)、`removeRow`(`:819`);插入转换 `addItem`(`:1021`)+ Javadoc 的 "Items insertion and deletion" 小节;itemId 上限 `PageIdUtils.MAX_ITEMID_NUM=0xFE`。对应 03 §5.4。
+
+### 5. 空闲空间怎么记账?什么时候压缩整理?
+
+(承接:前面讲了删/插时 item 表怎么动。但有个问题——**删除后行字节并不挪走**,那"剩余容量"到底怎么算?这页还能放多少?)
+
+**两个"空闲"概念,别混**
+
+页里同时存在两个量:
+
+- **`freeSpace` 计数器**(页头 `FREE_SPACE_OFF`,2 字节)= **总共可回收的字节 = 连续空隙 + 删除留下的洞**。它被维护得绝对精确——`setRealFreeSpace` 里 assert `freeSpace == actualFreeSpace(...)`(`:319`)。删除时它 `+=` 被删 entry 的大小(`removeRow:886`)。
+- **连续空隙** = items 表尾到 `dataOff` 之间那块**马上能写**的连续空间。删除**不动 `dataOff`**,所以连续空隙**不增长**——回收的字节变成行字节区中间的"洞",进不了连续空隙。
+
+> 所以:**计数器 ≥ 连续空隙**,差额就是那些散落的洞。
+
+**FreeList 用计数器(扣预留);"不连续"靠写入时按需压缩兜底**
+
+`getFreeSpace`(`:337`)= 计数器 − 预留(`ITEM+PAYLOAD+LINK = 12B`),语义是"**保证能放下的最大行(必要时先整理)**"。FreeList 就按它分桶(`putPage(io.getFreeSpace(...))`,`AbstractFreeList:171`)。
+
+那"计数器比连续空隙大"会不会挑错页?不会——写入路径(`getDataOffsetForWrite:1050` → `compactIfNeed:991`)这样兜底:
+
+```
+要写新行(前提:rowSize ≤ getFreeSpace,挑页时就保证了)
+  ├─ 连续空隙够放? ─是→ 直接在 dataOff 下方挖空间写
+  └─ 连续空隙不够(但计数器够)─→ compactDataEntries 把洞压成连续 → 再写
+```
+
+因为 计数器 = 连续空隙 + 所有洞,压缩后连续空隙 = 计数器,必然放得下。**FreeList 给的页绝不会"说能放却放不下"**,最多写入前在页内整理一次。
+
+**压缩整理怎么动(`compactDataEntries:1306`)**
+
+把活行往页尾(高地址)挪、挤掉洞,并更新各自 direct item 的 dataOff:
+
+```
+整理前(删过几行,有洞):
+[页头][items表][ 连续空隙(小) ][活x][洞1][活y][洞2][活z]   ←到页尾
+            表尾          ^dataOff
+
+整理后(活行压到页尾):
+[页头][items表][        连续空隙(变大)         ][活x][活y][活z]   ←到页尾
+            表尾                          ^dataOff(上移)
+```
+
+做法:按 dataOff 给活行排序,从高地址往低扫,每段活行右移去填前面的洞,并用 `setItem(itemId, directItemFromOffset(新位置))` 更新它 direct item 的 dataOff。
+
+**各部分变化 + 不动 link**
+
+- **页头**:`directCnt`/`indirectCnt` **不变**;`dataOff` **上移(变大)**;计数器前后一致(洞只是从"散落"变成"并入连续空隙")。
+- **items 表**:**结构完全不变**(下标 / itemId / 谁 direct 谁 indirect 都不动),变的只是每个 direct item 里存的 dataOff 数值;indirect item 连动都不用(它存的是"指向哪个 direct item 的下标")。
+- **行字节**:物理位置挪了(压到页尾),内容一字不改。
+- **link / B+树**:**完全不动**。link = pageId | (itemId<<56),itemId 没变(变的只是页内 dataOff),所以 B+树一条都不用改——这正是 direct/indirect item 设计的回报:**把"字节在哪(dataOff,可动)"和"外面怎么找(itemId/link,不动)"解耦**。
+
+> 另:Checkpoint / WAL 快照时还有一次**快照压缩**(`compactPage:1242`),它只是往另一个 buffer 复制一份"无垃圾"的短页写盘、省持久化空间,活页本身结构不变,当然也不动 link。
+
+📍 **代码锚点**:空闲计数器 `getRealFreeSpace`/`setRealFreeSpace`(`:318/:366`)、对外值 `getFreeSpace`(`:337`);写入兜底 `getDataOffsetForWrite`(`:1050`)→ `compactIfNeed`(`:991`)→ `isEnoughSpace`(`:916`);页内整理 `compactDataEntries`(`:1306`);快照压缩 `compactPage`(`:1242`)。对应 03 §5.4。
+
+### 6. 连续删多条,item 表会演化成什么样?(含删"已搬过的行")
+
+> 承小节 2、3:单条删除、删+插都讲过了。那**连续删好几条**呢?而且其中有的行可能**已经被搬过**——删它会怎样?
+
+**演化 trace:8 行连续删 3 条中间行**
+
+初始 `[a b c d e f g h]`(directCnt=8),依次删 c(itemId2)、e(4)、a(0):
+
+```
+删 c(2): [ a | b | h | d | e | f | g | (7→2) ]            directCnt=7 indirectCnt=1
+删 e(4): [ a | b | h | d | g | f | (6→4) | (7→2) ]        directCnt=6 indirectCnt=2
+删 a(0): [ f | b | h | d | g | (5→0) | (6→4) | (7→2) ]    directCnt=5 indirectCnt=3
+活行+本命link: b→1  d→3  f→5  g→6  h→7        死号: 0(a) 2(c) 4(e)
+```
+
+规律:
+
+- **每删一条中间行:`directCnt−1`、`indirectCnt+1`,表尾多一个 indirect**——末尾 direct 被搬去填洞,腾出的尾槽变 indirect。
+- **indirect 全堆在表尾,且按 itemId 升序**(`(5→0)(6→4)(7→2)`),为的是按外部 itemId 查 indirect 时能**二分查找**。
+- **direct 段变"杂"**:原位行(b、d)和借位搬来的行(f、h、g)混在一起;**死 itemId(0,2,4)恰好 = 被借去放搬动行的那些槽**。
+- **`indirectCnt ≤ directCnt` 始终成立**。
+- 注:删**最后一个 direct**(itemId=directCnt−1)是**干净直砍**,`directCnt−1` 但**不产生 indirect**(没洞要填)。
+
+**边角:删一条"已经被搬过的行"**
+
+上面末态里,h 是搬过的行(本命 itemId=7 ≥ directCnt=5,要经 indirect `(7→2)` 才能找到)。现在**删 h**:
+
+```
+删 h 前:   [ f | b | h | d | g | (5→0) | (6→4) | (7→2) ]   directCnt=5 indirectCnt=3
+删 h(7):  [ f | b | g | d | (5→0) | (6→2) ]               directCnt=4 indirectCnt=2
+活行+link: b→1  d→3  f→5(via 5→0)  g→6(via 6→2)      [h 已删]
+```
+
+发生了什么:
+
+1. itemId=7 ≥ directCnt → 是 indirect;**先二分找到它的 indirect 项**(slot7,`7→2`),顺着它定位到真正存 h 字节的 direct 槽(slot2)。
+2. 在 slot2 上做"搬末尾填洞":末尾 direct(g,slot4)搬进 slot2;但 **g 自己也是搬来的(有 indirect `6→4`)**,于是把那个 indirect **改指**为 `6→2`。
+3. 把 h 的 indirect 项(slot7)从 indirect 区**摘掉、压实**。
+4. 结果:**directCnt 5→4、indirectCnt 3→2**(注意:删搬动行是**消耗**一个 indirect,`indirectCnt−1`,而不是产生);其余 link 全保。
+
+> 对比一下两种删除对 indirect 区的影响:
+> - 删一条 **native direct**(在原位、本命 id < directCnt)→ **产生**一个 indirect(`indirectCnt+1`);
+> - 删一条**已搬动行**(本命 id ≥ directCnt)→ **消耗**一个 indirect(`indirectCnt−1`)。
+>
+> 所以持续增删下,indirect 区**有增有减、动态平衡**,不会无限膨胀。
+
+**那这些项挪来挪去,link 怎么还找得到?**
+
+(承接:上面 indirect 项被左移、被改指、被丢弃——位置一直在变,但外部 link 不会错。原因在于:**link 里的 itemId 不是当地址下标用的**,direct 和 indirect 两套查找规则不同。)
+
+按外部 link 的 itemId=X 找行(`getDataOffset`):
+
+| X 落在哪 | 怎么找 |
+|---|---|
+| **X < directCnt**(direct) | **槽位下标 == itemId** → 直接读 `slot[X]` 拿 dataOff |
+| **X ≥ directCnt**(indirect) | **二分 indirect 区**,找"存的 itemId == X"的那项,再顺它指的 direct 槽 |
+
+> 关键:**indirect item 是按它"存的 itemId"二分查找的,跟它坐在哪个槽位无关。** 所以 `(5→0)` 放 slot4 还是 slot5 都行。
+
+用删 h 后的状态 `[ f | b | g | d | (5→0) | (6→2) ]`(directCnt=4)逐条验证:
+
+```
+查 f(itemId=5): 5≥4 → 二分 indirect → slot4 的 (5→0) 命中 → direct 槽0 → f ✅
+查 g(itemId=6): 6≥4 → 二分 indirect → slot5 的 (6→2) 命中 → direct 槽2 → g ✅
+查 b(itemId=1): 1<4 → direct → slot1 → b ✅
+查 d(itemId=3): 3<4 → direct → slot3 → d ✅
+```
+
+全对。**二分能成立,是因为 indirect 区始终保持按 stored itemId 升序**(左移 / 改指只是整体平移或改值,不破坏有序)。
+
+> 一句话:**link 的 itemId 对 direct item 恰好等于下标(`slot[itemId]`),对 indirect item 是个"要被二分搜索的 key"**——项挪到哪个槽无所谓,只要它存的 itemId 对、且 indirect 区有序。这就是整个 direct/indirect 机制能让页内随便搬移、外部 link 却纹丝不动的根本原因。
+
+📍 **代码锚点**:删除总入口 `removeRow`(`:819`);按 itemId 二分找 indirect `findIndirectItemIndex`;搬末尾填洞 `moveLastItem`(`:734`,含"末尾 direct 已被 indirect 指过"的改指分支);按 link 查行 `getDataOffset`(direct 走下标、indirect 走二分)。对应 03 §5.4。
+
+---
+
 ## 你现在应该能回答
 
 1. 一页 4KB,删掉中间一条行后,留下的"洞"为什么不会让页永久碎片化?(提示:items 表 + 两种 item)
