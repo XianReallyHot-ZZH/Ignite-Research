@@ -285,7 +285,29 @@ wal.replay(cpPtr)   ← 把 WAL 读取器 seek 到 cpPtr(段 idx, 段内偏移)
 >
 > 一句话:**靠"环形缓冲原子切片(并发占位)+ SegmentAware(段号)+ 单刷盘者(串行落盘)"把并发和正确性分开管** → WALPointer 不重复、段文件不写坏,同时吞吐高。
 
-📍 **代码锚点**:段文件/追加 `FileWriteAheadLogManager`(`rollOver:1380`);记录落盘格式 `RecordV2Serializer`;WALPointer `WALPointer.java:27`;记录类 `DataPageInsertRecord`/`DataRecord`/`DataEntry`/`CheckpointRecord`;part-N.bin `FilePageStore`(`HEADER_SIZE:76`、`pageOffset:807`);cp 标记 `CheckpointMarkersStorage`(`:554`);cpPtr 派生 `CheckpointWorkflow.markCheckpointBegin:221`;重放 `GridCacheDatabaseSharedManager.restoreBinaryMemory`/`applyLogicalUpdates`;八阶段 `Checkpointer.doCheckpoint`+`CheckpointWorkflow`;**并发控制** `FileWriteHandleImpl.addRecord:222`、`SegmentedRingByteBuffer.offer`、`SegmentAware`、单刷盘者。对应 03 §6.1、§6.2、§6.3。
+### 10. 为什么物理 + 逻辑双层(以及谁可省)
+
+物理 WAL 和逻辑 WAL 是**两层,不是冗余**:
+
+| | 物理 WAL(`PageDeltaRecord`/`PageSnapshot`) | 逻辑 WAL(`DataRecord`/`DataEntry`、`TxRecord`) |
+|---|---|---|
+| 记的是 | **页字节怎么改**(哪个页、改哪些字节) | **缓存操作语义**(对 key 做 put/remove,值/版本/分区计数;事务提交/回滚) |
+| 覆盖范围 | **每一次**页改动(数据页、索引页、FreeList、meta、页分配/释放) | 只覆盖缓存条目操作 + 事务结果 |
+| 重放方式 | `applyDelta` 直接打回页字节(快) | 经缓存/事务管理器重做(慢、要全套栈) |
+| 是否强制 | **强制**(WAL 开就必写) | **可选**(`logDataRecords()` 控) |
+
+**为什么不能只留逻辑**:逻辑记录覆盖不了**页结构改动**——B+树分裂/合并、FreeList 桶调整、meta 页、页分配/回收等内部变更**没有"逻辑操作"形态**,逻辑 WAL 不记。只留逻辑 → 索引/FreeList/meta 全丢,页状态**无法重建**。**逻辑永远替代不了物理**。
+
+**为什么不能只留物理(为什么还要逻辑)**:只留物理页字节能恢复,但丢**"语义层"**——① **事务状态**(`TxRecord`;恢复时 `applyLogicalUpdates` 用 `collectTxStates` 捞回在途事务,该提交提交、该回滚回滚);② **分区状态/更新计数**(`CheckpointRecord.cacheGroupStates` + `DataEntry.partCnt`,rebalance 正确性与冲突检测靠它);③ **CDC**(外部消费者要 key→value 事件,物理 delta 对它无用)。
+
+**"只留一种"的非对称答案**:
+
+- **只留物理**:✅ 页状态能恢复(物理独占的能力);❌ 丢事务结果恢复、分区计数便利、CDC。纯页持久化场景物理本就够——这正是逻辑 WAL 设成**可选**(`logDataRecords`)的原因:不需要 CDC / 额外语义重放时可关掉,省 WAL 体积。
+- **只留逻辑**:❌ **不可行**,页结构(索引/FreeList/meta)恢复不了。
+
+> 一句话:**物理是"页字节底座",强制且不可替代;逻辑是"语义/事务/CDC 补充层",可选(关掉只是少掉 CDC 和计数便利,页恢复照样靠物理)。**
+
+📍 **代码锚点**:段文件/追加 `FileWriteAheadLogManager`(`rollOver:1380`);记录落盘格式 `RecordV2Serializer`;WALPointer `WALPointer.java:27`;记录类 `DataPageInsertRecord`/`DataRecord`/`DataEntry`/`CheckpointRecord`;part-N.bin `FilePageStore`(`HEADER_SIZE:76`、`pageOffset:807`);cp 标记 `CheckpointMarkersStorage`(`:554`);cpPtr 派生 `CheckpointWorkflow.markCheckpointBegin:221`;重放 `GridCacheDatabaseSharedManager.restoreBinaryMemory`/`applyLogicalUpdates:2489`(恢复事务/分区状态);八阶段 `Checkpointer.doCheckpoint`+`CheckpointWorkflow`;**并发控制** `FileWriteHandleImpl.addRecord:222`、`SegmentedRingByteBuffer.offer`、`SegmentAware`、单刷盘者;**逻辑 WAL 可选** `cctx.group().logDataRecords()`(`GridCacheMapEntry:3471`)。对应 03 §6.1、§6.2、§6.3。
 
 ---
 
