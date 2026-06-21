@@ -139,7 +139,7 @@ flowchart TD
 ```
 (`FullPageId.java:34` 的位布局;`PageIdUtils.java:29-41` 的宽度常量)
 
-- **pageIdx**(`:105`):该页在分区文件中的序号 = 磁盘偏移 `pageIndex * pageSize + 17`(`FilePageStore.pageOffset:807`)。
+- **pageIdx**(`:105`):该页在分区文件中的序号 = 磁盘偏移 `pageIndex * pageSize + headerSize()`(`FilePageStore.pageOffset:807-808`)。`headerSize()` 多态:2.17.0 默认 V2 格式(`FileVersionCheckingFactory.LATEST_VERSION=2`)下 `= pageSize`(`FilePageStoreV2:49`,即头部占**一整页**);旧 V1 格式 `HEADER_SIZE=17`(8 签名+4 版本+1 type+4 pageSize,`FilePageStore:76`)。
 - **partId**(`:182`):分区号。
 - **flag**(`:174`):页种类(`PageIdAllocator:32-45`):`FLAG_DATA=1`(数据/元/跟踪页)、`FLAG_IDX=2`(B+Tree 索引页)、`FLAG_AUX=4`(FreeList 等内部结构页)。
 - **offset/rotation**(最高 8 位):在普通 pageId 里通常为 0;在 **link** 里复用为 **itemId**(行在数据页内的槽号,见 §5.5)。
@@ -153,7 +153,7 @@ flowchart TD
 **段(Segment)分片降争用**:`Segment[] segments`(`:211`),每个页哈希到一个固定段:`segmentIndex = hash(effPageId*65537 + grpId) % n`(`:1885`)。所有该页的操作(acquire/lock/evict)只动一个段的锁,不同页的并发几乎不撞。
 
 **每段持有**(`:1954-1999`):
-- `LoadedPagesMap`(grpId, effPageId → 相对指针):常驻页的索引。
+- `LoadedPagesMap`(grpId, effPageId, **partGeneration** → 相对指针):常驻页的索引;键里的 `partGeneration`(分区代)让分区 destroy/recreate 后旧页表项正确失效。默认实现 `RobinHoodBackwardShiftHashMap`,可经 `IGNITE_LOADED_PAGES_BACKWARD_SHIFT_MAP` 切回 `FullPageIdTable`(`:182-184`)。
 - `PagePool`:该段的空闲页池——一个 **Treiber 无锁栈**(回收页)+ bump 分配器(新页)。
 - `PageReplacementPolicy`:换出策略。
 - `dirtyPages` / `checkpointPages`:脏页集 / checkpoint 快照(见 §6)。
@@ -162,7 +162,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     A["assert checkpointReadLock 持有 :540"] --> B["pmPageMgr.allocatePage<br/>(在磁盘文件预留一个 pageIdx) :545"]
-    B --> C["取目标段 writeLock :552"]
+    B --> C["取目标段 writeLock :554"]
     C --> D{"borrowOrAllocateFreePage<br/>有空闲页?"}
     D -->|"有(Treiber 栈/新分配)"| E["拿到相对指针"]
     D -->|"段满 INVALID_REL_PTR"| F["removePageForReplacement<br/>(换出一页) :587"]
@@ -177,7 +177,7 @@ flowchart TD
 
 ### 4.3 页锁:OffheapReadWriteLock
 
-每个页头偏移 32 字节处有一把 `OffheapReadWriteLock`(`:141`)。`readLock/writeLock/tryWriteLock`(`:1559/:1605`)带 **tag 校验**——tag = pageId 的 flag+offset,防止你锁住的页已经被换出/复用为别的逻辑页。`pinCount>0` 的页**绝不被换出**(`tryToRemovePage:2150`)。
+每个页头偏移 32 字节处有一把 `OffheapReadWriteLock`(`:141`)。`readLock`(`:1559`)/ `writeLockPage`(`:1618`)/ `tryWriteLockPage`(`:1605`)均**带 tag 校验**——tag = pageId 的 flag+offset,防止你锁住的页已经被换出/复用为别的逻辑页。`pinCount>0` 的页**绝不被换出**(`tryToRemovePage:2143`,其内 `:2150` 检查 `PageHeader.isAcquired` 即 pinCount>0)。
 
 ### 4.4 换出(两种,别混淆!)
 
@@ -186,7 +186,7 @@ flowchart TD
 | **PageReplacementPolicy**(页级) | `persistenceEnabled=true`,段物理满 | 整页 RAM↔磁盘 | `ClockPageReplacementPolicy`(默认)/`SegmentedLru`/`RandomLru` |
 | **PageEvictionTracker**(条目级) | `persistenceEnabled=false`,`DataPageEvictionMode≠DISABLED` | 把数据页里的 entry 挤出去 | `Random2LruPageEvictionTracker` 等 |
 
-> 默认持久化场景用的是**页级换出**(CLOCK 算法)。换出时若页是脏的(已改未刷),会先 `flushDirtyPage` 写回 `PageStore` 再回收缓冲(`tryToRemovePage:2167`)。
+> 默认持久化场景用的是**页级换出**(CLOCK 算法);非持久化且未显式开 `DataPageEvictionMode` 时,条目级 tracker 实际是 **`NoOpPageEvictionTracker`**(`IgniteCacheDatabaseSharedManager.createPageEvictionTracker:1327-1328`)——即默认**不淘汰**,只有用户显式设 `RANDOM_2_LRU`/`RANDOM_LRU` 才生效。换出时若页是脏的(已改未刷)且本轮 checkpoint 允许落盘(`checkpointPages.allowToSave`,`:2159` 守卫),才经 `saveDirtyPage.writePage` 写回 `PageStore` 再回收缓冲(`:2167`)。
 
 ### 4.5 DataRegion:内存预算 + 策略包
 
@@ -292,7 +292,7 @@ flowchart TD
 
 ### 5.4 数据页布局(槽位表)
 
-`AbstractDataPageIO.java:38`——经典的"两数组相向生长"槽位布局(类 Javadoc `:38-97` 有 ASCII):
+`AbstractDataPageIO.java:166`(类 Javadoc `:39-165` 有 ASCII)——经典的"两数组相向生长"槽位布局:
 ```
  ┌──────────────────────┬─────────────────────────────┐
  │  items 表(每项 2B)  │        行字节(变长)        │
@@ -329,8 +329,8 @@ flowchart TD
 
 | 类型 | 字段 | 用途 | 源码 |
 |---|---|---|---|
-| `CacheSearchRow` | key, link, hash, cacheId | B+Tree **导航探针**(轻,不读 value) | `CacheSearchRow.java:25`;`SearchRow.java:41`(link 初始 0) |
-| `CacheDataRow` | + value, version, expireTime, partition | **完整行** | `CacheDataRow.java:30`;`DataRow.java:31` |
+| `CacheSearchRow` | key, hash, cacheId | B+Tree **导航探针**(轻,不读 value;`SearchRow.link()` 抛异常,纯查键) | `CacheSearchRow.java:25`;`SearchRow.java:64` |
+| `CacheDataRow` | + value, version, expireTime, partition, link | **完整行**(写构造 `super(0)` 即 link 初始 0,落库后回填) | `CacheDataRow.java:30`;`DataRow.java:31`(`:72` 写构造) |
 
 > **性能杠杆**:B+Tree 遍历全程用 `keySearchRow`(便宜);只在命中叶子时才 `getRow`(`CacheDataTree.getRow:374`)顺着 link 读出完整 `DataRow`。
 
@@ -338,7 +338,7 @@ flowchart TD
 
 一个本地分区 = **{1 CacheFreeList, 1 CacheDataRowStore, 1 CacheDataTree, 1 PendingEntriesTree}**,在 `GridCacheOffheapManager.init0:1825-1970` 一次性建好,共享同一 PageMemory 与分区页。
 
-`CacheDataStoreImpl.update(...)`(`IgniteCacheOffheapManagerImpl.java:1598`)是一次单行写入的总编排:
+`CacheDataStoreImpl.update(...)`(`IgniteCacheOffheapManagerImpl.java:1598`)是一次单行写入的总编排。(`CacheDataStoreImpl` 是 `IgniteCacheOffheapManagerImpl` 的 `public static` 嵌套类,类声明 `:1196`,非顶层类。)
 ```mermaid
 flowchart TD
     U["update(key,val,ver,expire,oldRow) :1598"] --> M["makeDataRow(...) :1615<br/>(写构造,link=0)"]
@@ -378,9 +378,9 @@ TTL 扫描 ──► PendingTree ──┘
 
 接口 `IgniteWriteAheadLogManager.java`:`log(WalRecord):70`、`flush(ptr, fsync):100`、`replay(start):120`、`truncate(high):161`、`notchLastCheckpointPtr(ptr):171`。实现 `FileWriteAheadLogManager.java:172`。
 
-**段文件**:WAL 切成固定大小(默认 64MB)的 `.wal` 段文件,命名 `0000000000001234.wal`(`WAL_NAME_PATTERN:181`)。活跃段在 `wal/`,封存后移到 `wal/archive/`(可压缩成 `.wal.zip`,`:194`)。满了自动 rollover(`rollOver:1380`),且"WAL 太长没 checkpoint"会**强制触发 checkpoint**(`:1434`)。
+**段文件**:WAL 切成固定大小(默认 `DFLT_WAL_SEGMENT_SIZE=64MB`,`DataStorageConfiguration:135`)的 `.wal` 段文件,命名 `0000000000001234.wal`(`WAL_NAME_PATTERN:180`)。活跃段在 `db/wal/`,封存后移到 `db/wal/archive/`(可压缩成 `.wal.zip`,`:194`)。满了自动 rollover(`rollOver:1380`),且"WAL 太长没 checkpoint"会**强制触发 checkpoint**(`:1434`)。
 
-**WALPointer**(`WALPointer.java:27`):`(segmentIdx, fileOff, len)`,16 字节。它是 WAL/Checkpoint/恢复之间流通的"货币"。
+**WALPointer**(`WALPointer.java:27`,`POINTER_SIZE=16:32`):`(idx, fileOff, len)`——源码字段名为 `idx`(WAL 段文件序号)。它是 WAL/Checkpoint/恢复之间流通的"货币"。
 
 **记录类型**(`WALRecord.RecordType`,`WALRecord.java:41`),按用途分(`RecordPurpose`):
 - **PHYSICAL**:重建页原始字节(`PageSnapshot`、各种 `PageDeltaRecord` 如 `DataPageInsertRecord`)。
@@ -395,12 +395,14 @@ TTL 扫描 ──► PendingTree ──┘
 
 | 模式 | 含义 | 抗崩溃 |
 |---|---|---|
-| `FSYNC`(默认) | 提交返回前 fsync 到磁盘 | 抗掉电 |
-| `LOG_ONLY` | flush 到 OS page cache | 抗进程崩溃,不抗掉电 |
+| `LOG_ONLY`(**默认**) | flush 到 OS page cache | 抗进程崩溃,不抗掉电 |
+| `FSYNC` | 提交返回前 fsync 到磁盘 | 抗掉电 |
 | `BACKGROUND` | 后台定时 flush | 最后几次更新可能丢 |
 | `NONE` | 关 WAL | 仅优雅关机能持久 |
 
-**与 Checkpoint 的耦合**:`truncate(high):1150` 只删满足**全部**条件的段:`idx ≥ lastCheckpointPtr.index()` 不删、是最后活跃段不删、`high` 边界内不删、被别人 reserve(rebalance/CDC)不删。`notchLastCheckpointPtr:1208` 是 Checkpoint 完成后回填"最后完成 checkpoint 位置"的入口——它让旧段变得可删。
+> 默认是 `LOG_ONLY`(`DataStorageConfiguration.DFLT_WAL_MODE:138`);需要抗掉电时显式设 `FSYNC`。
+
+**与 Checkpoint 的耦合**:`truncate(high):1150` 只删满足**全部**条件的段:`idx ≥ lastCheckpointPtr.index()` 不删(二进制恢复还要用)、是最后已归档段不删(`idx ≥ lastArchived`)、`high` 边界内不删、被别人 reserve(rebalance/CDC)不删。`notchLastCheckpointPtr:1208` 是 Checkpoint 完成后回填"最后完成 checkpoint 位置"的入口——它让旧段变得可删。
 
 ### 6.2 Checkpoint:GridCacheDatabaseSharedManager
 
@@ -431,19 +433,19 @@ sequenceDiagram
     CWF->>Lock: ② writeLock()(快照瞬间)
     Note over Lock: 所有改页线程在此暂停, 已持 readLock 的会先排干
     CWF->>CWF: ③ 快照脏页: beginCheckpoint<br/>把每段 dirtyPages 复制到 checkpointPages 并清空 :1129-1134<br/>safeToUpdate=true(此后新写进新脏集)
-    CWF->>WAL: ④ log(CheckpointRecord) :289
+    CWF->>WAL: ④ log(CheckpointRecord) :290
     CWF->>Lock: ⑤ writeUnlock() ← 写线程恢复 :299
     Note over Mut: 改页线程恢复, 新脏页进下一轮
-    CWF->>WAL: ⑥ wal.flush(cpPtr, fsync=true) :309
-    Mgr->>Mgr: ⑦ 写 START 标记(临时文件→force→原子改名) :318
+    CWF->>WAL: ⑥ wal.flush(cpPtr, fsync=true) :314
+    Mgr->>Mgr: ⑦ 写 START 标记(临时文件→force→原子改名) :321
     CWF->>CWF: 拆分+排序脏页 :332
     par 多线程写页
-        CWF->>PS: checkpointWritePage(fullId) :197/485
+        CWF->>PS: writePages(fullId) :485
     end
-    PS->>PS: ⑧ 每个 store sync()(fsync) :540
-    CWF->>CWF: finishCheckpoint() 清快照 :545
+    PS->>PS: ⑧ 每个 store sync()(fsync) :553
+    CWF->>CWF: finishCheckpoint() 清快照 :549
     Mgr->>Mgr: 写 END 标记 :553
-    CWF->>WAL: notchLastCheckpointPtr(cpMark) :564 ← 旧 WAL 段可删
+    CWF->>WAL: notchLastCheckpointPtr(cpMark) :565 ← 旧 WAL 段可删
 ```
 
 > **为什么这么设计**:快照(writeLock)只占极短时间(冻结脏集 + 写一条 WAL 标记即放锁);真正耗时的"刷 N 页 + fsync"在**无锁**阶段多线程进行,不阻塞写线程。代价:快照期间改的页要用 **copy-on-write**——见下。
@@ -456,14 +458,14 @@ ${IGNITE_WORK}/
 ├── db/
 │   ├── cacheGroup-<grpId>/
 │   │   ├── index.bin          ← 索引分区页存储
-│   │   ├── part-0.bin         ← 分区 0:[ 17B头 | page0 | page1 | ... ](每页带 CRC)
-│   │   └── part-N.bin ...
+│   │   ├── part-0.bin         ← 分区 0:[ headerSize()头 | page0 | page1 | ... ](每页带 CRC)
+│   │   └── part-N.bin ...        默认 V2:头部=一整页(pageSize);旧 V1:17B 头
 │   ├── metastorage/
-│   └── cp/                    ← CheckpointMarkersStorage
-│       ├── <cpTs>-<cpId>-START.bin   ← 有 START 没 END = 上次崩在 checkpoint 中途
-│       └── <cpTs>-<cpId>-END.bin
-├── wal/                       ← 活跃段
-└── wal/archive/               ← 封存段(可压缩/删除)
+│   ├── cp/                    ← CheckpointMarkersStorage
+│   │   ├── <cpTs>-<cpId>-START.bin   ← 有 START 没 END = 上次崩在 checkpoint 中途
+│   │   └── <cpTs>-<cpId>-END.bin
+│   ├── wal/                   ← 活跃段
+│   └── wal/archive/           ← 封存段(可压缩/删除)
 ```
 
 ### 6.3 崩溃恢复
@@ -498,7 +500,7 @@ flowchart TD
 ```
 partition(key) = affFunction.partition(affinityKey(key))    // GridCacheAffinityManager.partition:156
 ```
-其中 `affinityKey` 允许**同值聚到同分区**(colocation):键类里标 `@AffinityKeyMapped` 的字段(或 `CacheKeyConfiguration.setAffinityKeyFieldName`)决定,默认是键本身(`GridCacheDefaultAffinityKeyMapper.affinityKey:78`)。`calculatePartition`(`:131`):`hash & mask`(2 的幂快速路径)或 `abs(hash) % parts`。
+其中 `affinityKey` 允许**同值聚到同分区**(colocation):键类里标 `@AffinityKeyMapped` 的字段(或 `CacheKeyConfiguration.setAffinityKeyFieldName`)决定,默认是键本身(`GridCacheDefaultAffinityKeyMapper.affinityKey:78`)。`calculatePartition`(`:131`):`(hashCode ^ (hashCode>>>16)) & mask`(2 的幂快速路径,带 16 位扰动)或 `U.safeAbs(hashCode % parts)`(防 `Integer.MIN_VALUE` 取负溢出)。
 
 ### 7.2 亲和性:Rendezvous(最高随机权重)哈希
 
@@ -516,7 +518,8 @@ partition(key) = affFunction.partition(affinityKey(key))    // GridCacheAffinity
 stateDiagram-v2
     [*] --> MOVING: 被亲和判定归属(创建/重平衡)
     MOVING --> OWNING: own() :611 (重平衡数据到齐)
-    MOVING --> MOVING: moving() :634 (数据陈旧,重新拉)
+    OWNING --> MOVING: moving() :634 (数据陈旧,回退重拉)
+    RENTING --> MOVING: moving() :634 (重新归属,回拉)
     OWNING --> RENTING: rent() :697 (不再是归属节点)
     MOVING --> RENTING: rent()
     RENTING --> EVICTED: finishEviction() :798 (store 清空 & 无人预留)
@@ -524,7 +527,7 @@ stateDiagram-v2
     RENTING --> [*]: destroyCacheDataStore, part-N.bin 删除
 ```
 
-- **reserve()/release()**(`:463/:497`):读写操作**钉住**分区,防止拓扑在脚下把它驱逐。`RENTING/EVICTED` 状态下 reserve 失败。
+- **reserve()/release()**(`:463/:482`):读写操作**钉住**分区,防止拓扑在脚下把它驱逐。`RENTING/EVICTED` 状态下 reserve 失败。(:497 是内部 `release0`。)
 - **MOVING**:该归本节点,但数据还在从别处流式拉(rebalance),读可能不全。
 - **OWNING**:完全归属,读写安全。
 - **RENTING**:不再归属,正在排空清理。
@@ -534,7 +537,7 @@ stateDiagram-v2
 
 `GridDhtPartitionTopologyImpl.java`:每个缓存组维护 `node2part`(`:116`)——`Map<UUID, Map<partId, GridDhtPartitionState>>`,即**每个节点、每个分区的状态**。带版本号 `updateSeq`(`:143`)拒绝过期更新;`StripedCompositeReadWriteLock(16)` 保护。
 
-- `localPartition(p)`(`:1064`)/ `getOrCreatePartition(p)`(`:900`):**仅在亲和判定本节点归属 p 时**才创建本地分区对象(`localPartition0:1022`)。
+- `localPartition(p)`(`:1064`)/ `getOrCreatePartition(p)`(`:900`):**仅在亲和判定本节点归属 p 时**才创建本地分区对象(`localPartition0:970`;亲和门控 `partitionLocalNode(p, topVer)` 在 `:998`,`if (!belongs) throw` 在 `:1023`)。
 - `nodes(p, topVer)`(`:1162`):先取亲和归属,再 union 进 `diffFromAffinity`(临时物理持有者)。
 
 ### 7.5 PME(分区交换)+ Rebalance
@@ -545,7 +548,7 @@ stateDiagram-v2
 flowchart TD
     EVT["discovery 事件<br/>(节点 join/leave)"] --> EX["GridDhtPartitionsExchangeFuture.init :892"]
     EX --> CALC["GridAffinityAssignmentCache.calculate :329<br/>重算亲和(只动受影响分区)"]
-    CALC --> AE["topology.afterExchange :768<br/>逐分区: 新归属→MOVING; 旧归属→RENTING"]
+    CALC --> AE["topology.afterExchange :768<br/>逐分区: 新归属且本地无/已驱逐→MOVING;<br/>非归属且当前 MOVING→RENTING"]
     AE --> RB["Rebalance 预加载<br/>从 OWNING 节点流式拷贝整分区字节到 MOVING 节点"]
     RB --> OWN["拷贝完 own() → OWNING"]
     AE --> EV["旧节点 RENTING → EVICTED<br/>destroyCacheDataStore + 删 part-N.bin"]
@@ -576,16 +579,17 @@ flowchart LR
 
 ### 8.2 BinaryObject:自描述二进制格式
 
-`BinaryObjectImpl.java:60`——一个 `byte[]` 的窗口。**24 字节定长头**(`GridBinaryMarshaller.java:208-229`):
+`BinaryObjectImpl.java:60`(类声明;`byte[] arr` 字段在 `:70`)——一个 `byte[]` 的窗口。**24 字节定长头**(`DFLT_HDR_LEN=24`,`GridBinaryMarshaller.java:229`;各字段位置常量 `:208-226`):
 
 ```
-偏移: 0    1    2     4     8     12    16    20    24
-      ┌────┬──┬─┬─────┬─────┬─────┬─────┬─────┬─────────────┐
-      │ver │fl│fl│typeId│hash│total│schema│schema│  字段值 ...  │
-      │    │ag│ag│      │Code│ Len │ Id   │/rawOf│             │
-      └────┴──┴─┴─────┴─────┴─────┴─────┴─────┴─────────────┘
-      1B   1B 1B  4B    4B    4B    4B    4B
+偏移: 0    1    2      4     8     12    16    20    24
+      ┌────┬──┬──────┬─────┬─────┬─────┬─────┬─────┬─────────────┐
+      │type│ver│flags │typeId│hash│total│schema│schema│  字段值 ...  │
+      │OBJ │  │(2B)  │      │Code│ Len │ Id   │/rawOf│             │
+      └────┴──┴──────┴─────┴─────┴─────┴─────┴─────┴─────────────┘
+      1B   1B  2B    4B    4B    4B    4B    4B
 ```
+(byte0=对象类型标记 `OBJ=103`,byte1=`PROTO_VER`,byte2-3=`flags` 2 字节 short)
 
 - 头里有 typeId、schemaId、字段偏移表(footer)→ **任意字段可按偏移直读,无需读其它字段**(部分反序列化)。
 - **schema 演进**:加字段→换 schemaId,旧读节点按偏移表跳过未知字段。
@@ -599,7 +603,7 @@ flowchart LR
 ```
 [ payloadSize:short(2) | cacheId?:int(4) | keyBytes | valueBytes | version(var) | expireTime:long(8) ]
 ```
-(共享缓存组才有 cacheId;version 是 `GridCacheVersion`=拓扑版本+序号+节点 ID)。大值跨页时按同样顺序分片(`writeFragmentData`)。
+(共享缓存组才有 cacheId;version 是 `GridCacheVersion`=拓扑版本(topVer)+ 全局序号(order)+ 节点顺序(nodeOrder,内含数据中心 ID))。大值跨页时按同样顺序分片(`writeFragmentData`)。
 
 ---
 
@@ -716,7 +720,7 @@ flowchart LR
 
 **事务**:put 先写进 entry/写集,**commit 时**才经 `storeValue → CacheDataStoreImpl.update` 真正落库 + 写 WAL DataRecord。分布式 2PC:near(协调)→ dht(主)→ backup,各跑 prepare/commit。
 
-> **MVCC 说明**:2.17.0 **没有**多版本行存储(`CacheDataRow` 无 MVCC 列;无 `CacheCoordinatorsSharedManager`)。代码里的 `ctx.mvcc()` 指的是**锁管理器/锁候选**(lock candidate),不是快照隔离的 MVCC。行版本是单版本,靠 `GridCacheVersion`(拓扑版本+序号+节点)做冲突检测。实验性 MVCC 栈在更早分支存在过,2.17 前已移除。
+> **MVCC 说明**:2.17.0 **没有**多版本行存储(`CacheDataRow` 无 MVCC 列;无 `CacheCoordinatorsSharedManager`)。代码里的 `ctx.mvcc()` 指的是**锁管理器/锁候选**(lock candidate),不是快照隔离的 MVCC。行版本是单版本,靠 `GridCacheVersion`(拓扑版本 topVer + 全局序号 order + 节点顺序 nodeOrder,内含数据中心 ID)做冲突检测。实验性 MVCC 栈在更早分支存在过,2.17 前已移除。
 
 ---
 
